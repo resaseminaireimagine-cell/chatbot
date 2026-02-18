@@ -5,7 +5,7 @@
 # - Chat: réponses UNIQUEMENT sourcées (citations fichier + extrait)
 #
 # Déps:
-#   pip install -r requirements.txt
+#   pip install streamlit requests pypdf python-docx scikit-learn lxml
 #
 # Run:
 #   streamlit run app.py
@@ -20,6 +20,9 @@ from pathlib import Path
 from typing import List, Dict, Tuple, Optional, Any
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import streamlit as st
 from pypdf import PdfReader
 from docx import Document as DocxDocument
@@ -79,6 +82,43 @@ def looks_like_binary_or_empty(text: str) -> bool:
         return True
     letters = sum(ch.isalpha() for ch in text)
     return letters < 20
+
+
+# =========================
+# REQUESTS SESSION (retries)
+# =========================
+def make_session(username: str, password: str) -> requests.Session:
+    sess = requests.Session()
+    sess.auth = (username, password)
+
+    retry = Retry(
+        total=5,
+        connect=5,
+        read=5,
+        backoff_factor=0.6,
+        status_forcelist=[429, 500, 502, 503, 504],
+        allowed_methods=frozenset(["GET", "PROPFIND", "HEAD", "OPTIONS"]),
+        raise_on_status=False,
+    )
+    adapter = HTTPAdapter(max_retries=retry, pool_connections=10, pool_maxsize=10)
+    sess.mount("https://", adapter)
+    sess.mount("http://", adapter)
+    return sess
+
+def check_connectivity(sess: requests.Session, base: str, timeout_s: int = 20) -> Tuple[bool, str]:
+    """
+    Simple HEAD/GET to see if the host is reachable (network), before PROPFIND.
+    """
+    try:
+        r = sess.request("OPTIONS", base.rstrip("/") + "/", timeout=timeout_s)
+        # even 401/403 means reachable; timeout/conn error means not reachable
+        return True, f"Reachable (HTTP {r.status_code})"
+    except requests.exceptions.ConnectTimeout:
+        return False, "ConnectTimeout (réseau / firewall / VPN ?)"
+    except requests.exceptions.ConnectionError as e:
+        return False, f"ConnectionError ({e})"
+    except Exception as e:
+        return False, f"Erreur connexion ({e})"
 
 
 # =========================
@@ -159,26 +199,20 @@ def chunk_text(text: str) -> List[str]:
 # =========================
 @dataclass
 class RemoteEntry:
-    rel_path: str   # path relative to user's WebDAV root (after base)
+    rel_path: str
     is_dir: bool
     etag: str
     size: int
 
 def _dav_url(base: str, rel_path: str) -> str:
-    """
-    Build URL safely by URL-encoding each segment.
-    Nextcloud requires proper encoding for spaces/accents.
-    """
     base = base.rstrip("/")
     rel_path = rel_path.strip("/")
-
     if not rel_path:
         return base + "/"
-
     parts = [quote(p) for p in rel_path.split("/")]
     return base + "/" + "/".join(parts)
 
-def webdav_propfind(session: requests.Session, url: str, depth: int = 1, timeout: int = 30) -> bytes:
+def webdav_propfind(session: requests.Session, url: str, depth: int = 1, timeout_s: int = 60) -> bytes:
     headers = {"Depth": str(depth), "Content-Type": "application/xml; charset=utf-8"}
     body = """<?xml version="1.0" encoding="utf-8" ?>
 <d:propfind xmlns:d="DAV:">
@@ -188,15 +222,12 @@ def webdav_propfind(session: requests.Session, url: str, depth: int = 1, timeout
     <d:getcontentlength />
   </d:prop>
 </d:propfind>"""
-    r = session.request("PROPFIND", url, headers=headers, data=body.encode("utf-8"), timeout=timeout)
+    # timeout can be (connect, read)
+    r = session.request("PROPFIND", url, headers=headers, data=body.encode("utf-8"), timeout=(30, timeout_s))
     r.raise_for_status()
     return r.content
 
 def webdav_list_children(session: requests.Session, base: str, folder_rel: str) -> List[RemoteEntry]:
-    """
-    List direct children of a folder (Depth:1).
-    folder_rel is relative to base (user root), ex: 'KB_CentreSeminaire_OFFICIEL'
-    """
     from lxml import etree
 
     url = _dav_url(base, folder_rel)
@@ -205,24 +236,20 @@ def webdav_list_children(session: requests.Session, base: str, folder_rel: str) 
     root = etree.fromstring(xml)
     ns = {"d": "DAV:"}
 
-    # Nextcloud returns href like /remote.php/dav/files/user/KB/... (URL-encoded)
-    base_path = re.sub(r"^https?://[^/]+", "", base).rstrip("/")  # /remote.php/dav/files/user
+    base_path = re.sub(r"^https?://[^/]+", "", base).rstrip("/")
     entries: List[RemoteEntry] = []
 
     for resp in root.findall("d:response", namespaces=ns):
         href_el = resp.find("d:href", namespaces=ns)
         href_raw = href_el.text if href_el is not None else ""
-        href_raw = href_raw or ""
-        href = unquote(href_raw)  # decode %20 etc.
+        href = unquote(href_raw or "")
 
-        # Convert href to path relative to base root
         if href.startswith(base_path):
             rel = href[len(base_path):].lstrip("/")
         else:
             m = re.search(r"/remote\.php/dav/files/[^/]+/(.*)$", href)
             rel = m.group(1) if m else href.lstrip("/")
 
-        # Skip self folder entry
         rel_norm = rel.rstrip("/")
         folder_norm = folder_rel.strip("/").rstrip("/")
         if rel_norm == folder_norm:
@@ -277,9 +304,9 @@ def webdav_recursive_list_files(session: requests.Session, base: str, root_folde
                         return out
     return out
 
-def webdav_download(session: requests.Session, base: str, rel_path: str, dest: Path, timeout: int = 90):
+def webdav_download(session: requests.Session, base: str, rel_path: str, dest: Path, timeout_s: int = 180):
     url = _dav_url(base, rel_path)
-    r = session.get(url, stream=True, timeout=timeout)
+    r = session.get(url, stream=True, timeout=(30, timeout_s))
     r.raise_for_status()
     dest.parent.mkdir(parents=True, exist_ok=True)
     with dest.open("wb") as f:
@@ -314,8 +341,7 @@ def sync_from_webdav(base: str, username: str, password: str, remote_folder: str
     ensure_dirs()
     manifest = load_manifest()
 
-    sess = requests.Session()
-    sess.auth = (username, password)
+    sess = make_session(username, password)
 
     files = webdav_recursive_list_files(sess, base, remote_folder)
     total = max(len(files), 1)
@@ -334,11 +360,7 @@ def sync_from_webdav(base: str, username: str, password: str, remote_folder: str
                 needs = False
 
         if needs:
-            try:
-                webdav_download(sess, base, rel, local_path)
-            except Exception:
-                # continue silently; the file will be retried next sync
-                pass
+            webdav_download(sess, base, rel, local_path)
 
         manifest[rel] = {"etag": f.etag, "size": f.size, "local_path": str(local_path)}
 
@@ -376,28 +398,35 @@ def index_documents(manifest: Dict[str, Dict], progress_cb=None) -> KBIndex:
         lp = Path(meta.get("local_path", ""))
         if not lp.exists():
             continue
-        try:
-            text = extract_text(lp)
-            if looks_like_binary_or_empty(text):
-                continue
-            text = re.sub(r"[ \t]+", " ", text).strip()
-            for j, ck in enumerate(chunk_text(text)):
-                chunks.append(Chunk(doc_path=rel, chunk_id=j, text=ck))
-        except Exception:
+        text = extract_text(lp)
+        if looks_like_binary_or_empty(text):
             continue
+        text = re.sub(r"[ \t]+", " ", text).strip()
+
+        ck_list = chunk_text(text)
+        for j, ck in enumerate(ck_list):
+            chunks.append(Chunk(doc_path=rel, chunk_id=j, text=ck))
 
         if progress_cb:
             progress_cb(i / total, f"Index {i}/{total} — {lp.name}")
 
-    if not chunks:
-        v = TfidfVectorizer(max_features=50000, ngram_range=(1, 2))
-        m = v.fit_transform([""])
-        return KBIndex(v, m, [], time.time(), build_manifest_hash(manifest))
+    manifest_hash = build_manifest_hash(manifest)
 
-    corpus = [c.text for c in chunks]
+    # SAFE fallback: never fit on empty string
+    if not chunks:
+        vectorizer = TfidfVectorizer(max_features=1000, ngram_range=(1, 2))
+        matrix = vectorizer.fit_transform(["placeholder"])
+        return KBIndex(vectorizer, matrix, [], time.time(), manifest_hash)
+
+    corpus = [c.text for c in chunks if norm(c.text)]
+    if not corpus:
+        vectorizer = TfidfVectorizer(max_features=1000, ngram_range=(1, 2))
+        matrix = vectorizer.fit_transform(["placeholder"])
+        return KBIndex(vectorizer, matrix, [], time.time(), manifest_hash)
+
     vectorizer = TfidfVectorizer(max_features=70000, ngram_range=(1, 2))
     matrix = vectorizer.fit_transform(corpus)
-    return KBIndex(vectorizer, matrix, chunks, time.time(), build_manifest_hash(manifest))
+    return KBIndex(vectorizer, matrix, chunks, time.time(), manifest_hash)
 
 def save_index(idx: KBIndex):
     ensure_dirs()
@@ -437,7 +466,7 @@ def build_answer(query: str, hits: List[Tuple[Chunk, float]]) -> str:
     if not hits:
         return "Je n’ai pas trouvé de source suffisamment pertinente dans la base. Reformule, ou ajoute le document manquant dans la KB."
 
-    lines = ["Voici ce que la base contient de plus pertinent (extraits) :"]
+    lines = ["Voici les extraits les plus pertinents :"]
     sources = []
     for ch, sc in hits:
         snippet = re.sub(r"\s+", " ", ch.text).strip()
@@ -466,16 +495,16 @@ with st.expander("⚙️ Connexion Cloudbox (WebDAV)", expanded=True):
     with c1:
         webdav_base = st.text_input("URL WebDAV (base)", value=DEFAULT_WEBDAV_BASE)
         remote_folder = st.text_input("Dossier à indexer", value="KB_CentreSeminaire_OFFICIEL")
-        st.caption("Crée ce dossier dans Cloudbox (OFFICIEL). Mets les archives dans 99_ARCHIVES ou ARCHIVES.")
+        st.caption("Crée ce dossier dans Cloudbox. Mets les archives dans 99_ARCHIVES ou ARCHIVES.")
     with c2:
         username = st.text_input("Identifiant", value="ambroise.leleve")
     with c3:
         password = st.text_input("Mot de passe (idéal: mot de passe d’application)", type="password")
 
-    b1, b2, b3 = st.columns([1, 1, 2])
-    btn_sync_reindex = b1.button("📥 Sync + 🧠 Réindex", use_container_width=True)
-    btn_reindex = b2.button("🧠 Réindex (sans sync)", use_container_width=True)
-    debug = b3.checkbox("Debug", value=False)
+    c4, c5, c6 = st.columns([1, 1, 2])
+    btn_sync_reindex = c4.button("📥 Sync + 🧠 Réindex", use_container_width=True)
+    btn_reindex = c5.button("🧠 Réindex (sans sync)", use_container_width=True)
+    debug = c6.checkbox("Debug", value=False)
 
 if debug:
     st.write("Cache:", str(CACHE_DIR))
@@ -495,20 +524,35 @@ if btn_sync_reindex:
     if not webdav_base or not username or not password or not remote_folder:
         st.error("Renseigne URL, identifiant, mot de passe et dossier.")
     else:
-        try:
-            cb = prog_cb_factory()
-            manifest = sync_from_webdav(webdav_base, username, password, remote_folder, progress_cb=cb)
-            st.success(f"Sync OK — {len(manifest)} fichiers suivis.")
-        except Exception as e:
-            st.error(f"Erreur sync WebDAV: {e}")
+        sess = make_session(username, password)
+        ok, msg = check_connectivity(sess, webdav_base, timeout_s=20)
+        if not ok:
+            st.error(
+                "Impossible de joindre Cloudbox depuis l’endroit où tourne l’app.\n\n"
+                f"Détail: **{msg}**\n\n"
+                "👉 Si tu es sur Streamlit Cloud / un serveur externe: c’est très probablement un blocage réseau.\n"
+                "Solution: exécuter l’app en interne (réseau Imagine/VPN) ou faire ouvrir l’accès WebDAV côté IT."
+            )
+        else:
+            try:
+                cb = prog_cb_factory()
+                manifest = sync_from_webdav(webdav_base, username, password, remote_folder, progress_cb=cb)
+                st.success(f"Sync OK — {len(manifest)} fichiers suivis.")
+            except Exception as e:
+                st.error(f"Erreur sync WebDAV: {e}")
+                manifest = load_manifest()  # keep previous if any
 
-        try:
-            cb2 = prog_cb_factory()
-            idx = index_documents(manifest, progress_cb=cb2)
-            save_index(idx)
-            st.success("Index mis à jour.")
-        except Exception as e:
-            st.error(f"Erreur indexation: {e}")
+            # Index only if we actually have something
+            if manifest:
+                try:
+                    cb2 = prog_cb_factory()
+                    idx = index_documents(manifest, progress_cb=cb2)
+                    save_index(idx)
+                    st.success("Index mis à jour.")
+                except Exception as e:
+                    st.error(f"Erreur indexation: {e}")
+            else:
+                st.warning("Aucun fichier synchronisé. Indexation ignorée.")
 
 if btn_reindex:
     if not manifest:
@@ -526,7 +570,7 @@ st.divider()
 st.subheader("💬 Chat (réponses sourcées)")
 
 if not idx or not idx.chunks:
-    st.info("Aucun index. Clique sur “Sync + Réindex”.")
+    st.info("Aucun index (ou aucun contenu exploitable). Clique sur “Sync + Réindex”.")
     st.stop()
 
 if "chat" not in st.session_state:
@@ -554,4 +598,4 @@ if q:
     with st.chat_message("assistant"):
         st.markdown(a)
 
-st.caption("Conseil: commence avec 10–20 docs OFFICIELS. Plus tu ajoutes des archives, plus tu obtiens des réponses 'vieilles'.")
+st.caption("Conseil: commence avec 10–30 docs OFFICIELS. Mets le reste en ARCHIVES.")
