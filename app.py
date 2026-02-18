@@ -1,100 +1,94 @@
-# app.py — Chatbot interne (RAG) sur base Cloudbox/Nextcloud via WebDAV
-# -------------------------------------------------------------------
-# Objectif: un assistant interne fiable, qui répond UNIQUEMENT avec sources.
-# - Sync depuis WebDAV (Nextcloud) -> cache local
-# - Indexation TF-IDF (local, sans API externe)
-# - Chat + citations (fichier + extrait)
+# app.py — Chatbot interne (RAG) sur Cloudbox/Nextcloud via WebDAV (robuste)
+# ------------------------------------------------------------------------
+# - Sync WebDAV -> cache local
+# - Index TF-IDF local (pas d'API externe)
+# - Chat: réponses UNIQUEMENT sourcées (citations fichier + extrait)
 #
 # Déps:
-#   pip install streamlit requests pypdf python-docx scikit-learn lxml
+#   pip install -r requirements.txt
 #
-# Lancement:
+# Run:
 #   streamlit run app.py
 
-import os
-import re
-import io
 import json
 import time
 import pickle
 import hashlib
+import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 import requests
 import streamlit as st
 from pypdf import PdfReader
 from docx import Document as DocxDocument
-
 from sklearn.feature_extraction.text import TfidfVectorizer
 from sklearn.metrics.pairwise import cosine_similarity
+
+from urllib.parse import unquote, quote
+
 
 # =========================
 # CONFIG
 # =========================
-APP_TITLE = "Chatbot interne — Base Cloudbox (RAG)"
+APP_TITLE = "Chatbot interne — Base Cloudbox (Nextcloud) via WebDAV"
 DEFAULT_WEBDAV_BASE = "https://cloudbox.institutimagine.org/remote.php/dav/files/ambroise.leleve"
+
 CACHE_DIR = Path.home() / ".cloudbox_kb_cache"
 FILES_DIR = CACHE_DIR / "files"
 INDEX_PATH = CACHE_DIR / "index.pkl"
+MANIFEST_PATH = CACHE_DIR / "manifest.json"
 
-ALLOWED_EXT = {".pdf", ".docx", ".txt", ".md"}  # volontairement strict au début
+ALLOWED_EXT = {".pdf", ".docx", ".txt", ".md"}
 IGNORE_DIR_NAMES = {"99_ARCHIVES", "ARCHIVES", ".trash", ".Trash", ".snapshot", ".snapshots"}
 
-# Chunking (simple, robuste)
 CHUNK_TARGET_CHARS = 1400
 CHUNK_OVERLAP_CHARS = 180
 MIN_CHUNK_CHARS = 350
 
-# Retrieval / Answer
-TOP_K = 6              # docs/chunks récupérés
-MIN_SCORE = 0.18       # seuil de pertinence (TF-IDF) — ajustable
+TOP_K = 6
+MIN_SCORE = 0.18
 
-# Safety: réponses sourcées seulement
 REQUIRE_SOURCES = True
+
 
 # =========================
 # UTILS
 # =========================
 def norm(s: str) -> str:
-    if s is None:
-        return ""
-    s = str(s).replace("\u00A0", " ").replace("\t", " ").replace("\r", " ")
+    s = "" if s is None else str(s)
+    s = s.replace("\u00A0", " ").replace("\t", " ").replace("\r", " ")
     s = re.sub(r"\s+", " ", s).strip()
     return s
 
 def sha1_text(s: str) -> str:
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
-def safe_rel_path(p: str) -> str:
-    # Normalize a webdav href/path into a relative path
-    p = p.replace("\\", "/")
-    p = re.sub(r"^https?://[^/]+", "", p)  # strip host if any
-    return p.lstrip("/")
-
 def ensure_dirs():
     CACHE_DIR.mkdir(parents=True, exist_ok=True)
     FILES_DIR.mkdir(parents=True, exist_ok=True)
 
+def should_ignore_remote(rel_path: str) -> bool:
+    rel_path = rel_path.replace("\\", "/").strip("/")
+    parts = [p for p in rel_path.split("/") if p]
+    return any(p in IGNORE_DIR_NAMES for p in parts)
+
 def looks_like_binary_or_empty(text: str) -> bool:
     if not text:
         return True
-    # too many replacement chars / no letters
     letters = sum(ch.isalpha() for ch in text)
     return letters < 20
 
+
 # =========================
-# FILE TEXT EXTRACTORS
+# TEXT EXTRACTORS
 # =========================
 def extract_pdf_text(path: Path) -> str:
     try:
         with path.open("rb") as f:
             reader = PdfReader(f)
-            parts = []
-            for p in reader.pages:
-                parts.append(p.extract_text() or "")
-            return "\n".join(parts)
+            return "\n".join([(p.extract_text() or "") for p in reader.pages])
     except Exception:
         return ""
 
@@ -123,13 +117,13 @@ def extract_text(path: Path) -> str:
             return ""
     return ""
 
+
 # =========================
 # CHUNKING
 # =========================
-def chunk_text(text: str, target_chars: int = CHUNK_TARGET_CHARS, overlap_chars: int = CHUNK_OVERLAP_CHARS) -> List[str]:
+def chunk_text(text: str) -> List[str]:
     text = text.replace("\u00A0", " ")
-    # Split on paragraphs / bullets first
-    blocks = [b.strip() for b in re.split(r"\n{2,}|\r\n{2,}", text) if b.strip()]
+    blocks = [b.strip() for b in re.split(r"\n{2,}", text) if b.strip()]
     if not blocks:
         blocks = [text.strip()]
 
@@ -139,7 +133,7 @@ def chunk_text(text: str, target_chars: int = CHUNK_TARGET_CHARS, overlap_chars:
         b = re.sub(r"[ \t]+", " ", b).strip()
         if not b:
             continue
-        if len(cur) + len(b) + 1 <= target_chars:
+        if len(cur) + len(b) + 1 <= CHUNK_TARGET_CHARS:
             cur = (cur + "\n" + b).strip()
         else:
             if len(cur) >= MIN_CHUNK_CHARS:
@@ -149,44 +143,43 @@ def chunk_text(text: str, target_chars: int = CHUNK_TARGET_CHARS, overlap_chars:
     if cur and len(cur) >= MIN_CHUNK_CHARS:
         chunks.append(cur)
 
-    # overlap by chars (simple)
-    if overlap_chars > 0 and len(chunks) > 1:
-        out = []
-        for i, c in enumerate(chunks):
-            if i == 0:
-                out.append(c)
-            else:
-                prev = out[-1]
-                ov = prev[-overlap_chars:] if len(prev) > overlap_chars else prev
-                out.append((ov + "\n" + c).strip())
+    if CHUNK_OVERLAP_CHARS > 0 and len(chunks) > 1:
+        out = [chunks[0]]
+        for i in range(1, len(chunks)):
+            prev = out[-1]
+            ov = prev[-CHUNK_OVERLAP_CHARS:] if len(prev) > CHUNK_OVERLAP_CHARS else prev
+            out.append((ov + "\n" + chunks[i]).strip())
         chunks = out
 
     return chunks
 
+
 # =========================
-# WEBDAV (Nextcloud) sync
+# WEBDAV (Nextcloud)
 # =========================
 @dataclass
 class RemoteEntry:
-    href: str
+    rel_path: str   # path relative to user's WebDAV root (after base)
     is_dir: bool
     etag: str
     size: int
 
-def webdav_propfind_list(session: requests.Session, base: str, remote_path: str, depth: int = 1, timeout: int = 30) -> List[RemoteEntry]:
+def _dav_url(base: str, rel_path: str) -> str:
     """
-    List children in a WebDAV folder using PROPFIND.
-    remote_path is relative to base, no leading slash required.
+    Build URL safely by URL-encoding each segment.
+    Nextcloud requires proper encoding for spaces/accents.
     """
-    # Build URL
     base = base.rstrip("/")
-    remote_path = remote_path.strip("/")
-    url = f"{base}/{remote_path}" if remote_path else base + "/"
+    rel_path = rel_path.strip("/")
 
-    headers = {
-        "Depth": str(depth),
-        "Content-Type": "application/xml; charset=utf-8",
-    }
+    if not rel_path:
+        return base + "/"
+
+    parts = [quote(p) for p in rel_path.split("/")]
+    return base + "/" + "/".join(parts)
+
+def webdav_propfind(session: requests.Session, url: str, depth: int = 1, timeout: int = 30) -> bytes:
+    headers = {"Depth": str(depth), "Content-Type": "application/xml; charset=utf-8"}
     body = """<?xml version="1.0" encoding="utf-8" ?>
 <d:propfind xmlns:d="DAV:">
   <d:prop>
@@ -195,112 +188,97 @@ def webdav_propfind_list(session: requests.Session, base: str, remote_path: str,
     <d:getcontentlength />
   </d:prop>
 </d:propfind>"""
-
     r = session.request("PROPFIND", url, headers=headers, data=body.encode("utf-8"), timeout=timeout)
     r.raise_for_status()
+    return r.content
 
-    # Parse XML with minimal regex fallback (avoid heavy dependency)
-    # But lxml is installed via deps recommendation; still keep robust.
-    try:
-        from lxml import etree
-        root = etree.fromstring(r.content)
-        ns = {"d": "DAV:"}
-
-        entries = []
-        for resp in root.findall("d:response", namespaces=ns):
-            href_el = resp.find("d:href", namespaces=ns)
-            href = href_el.text if href_el is not None else ""
-            propstat = resp.find("d:propstat", namespaces=ns)
-            if propstat is None:
-                continue
-            prop = propstat.find("d:prop", namespaces=ns)
-            if prop is None:
-                continue
-
-            rtype = prop.find("d:resourcetype", namespaces=ns)
-            is_dir = False
-            if rtype is not None and rtype.find("d:collection", namespaces=ns) is not None:
-                is_dir = True
-
-            etag_el = prop.find("d:getetag", namespaces=ns)
-            etag = (etag_el.text or "").strip('"') if etag_el is not None else ""
-
-            size_el = prop.find("d:getcontentlength", namespaces=ns)
-            try:
-                size = int(size_el.text) if size_el is not None and size_el.text else 0
-            except Exception:
-                size = 0
-
-            entries.append(RemoteEntry(href=href, is_dir=is_dir, etag=etag, size=size))
-
-        return entries
-    except Exception:
-        # Fallback: if XML parsing fails, return nothing
-        return []
-
-def should_ignore_remote(path_rel: str) -> bool:
-    parts = [p for p in path_rel.split("/") if p]
-    for p in parts:
-        if p in IGNORE_DIR_NAMES:
-            return True
-    return False
-
-def webdav_recursive_list_files(session: requests.Session, base: str, root_remote_folder: str, max_files: int = 3000) -> List[RemoteEntry]:
+def webdav_list_children(session: requests.Session, base: str, folder_rel: str) -> List[RemoteEntry]:
     """
-    BFS listing files under root_remote_folder (relative).
+    List direct children of a folder (Depth:1).
+    folder_rel is relative to base (user root), ex: 'KB_CentreSeminaire_OFFICIEL'
     """
-    base = base.rstrip("/")
-    root_remote_folder = root_remote_folder.strip("/")
-    queue = [root_remote_folder]
-    files: List[RemoteEntry] = []
-    seen_dirs = set()
+    from lxml import etree
+
+    url = _dav_url(base, folder_rel)
+    xml = webdav_propfind(session, url, depth=1)
+
+    root = etree.fromstring(xml)
+    ns = {"d": "DAV:"}
+
+    # Nextcloud returns href like /remote.php/dav/files/user/KB/... (URL-encoded)
+    base_path = re.sub(r"^https?://[^/]+", "", base).rstrip("/")  # /remote.php/dav/files/user
+    entries: List[RemoteEntry] = []
+
+    for resp in root.findall("d:response", namespaces=ns):
+        href_el = resp.find("d:href", namespaces=ns)
+        href_raw = href_el.text if href_el is not None else ""
+        href_raw = href_raw or ""
+        href = unquote(href_raw)  # decode %20 etc.
+
+        # Convert href to path relative to base root
+        if href.startswith(base_path):
+            rel = href[len(base_path):].lstrip("/")
+        else:
+            m = re.search(r"/remote\.php/dav/files/[^/]+/(.*)$", href)
+            rel = m.group(1) if m else href.lstrip("/")
+
+        # Skip self folder entry
+        rel_norm = rel.rstrip("/")
+        folder_norm = folder_rel.strip("/").rstrip("/")
+        if rel_norm == folder_norm:
+            continue
+
+        propstat = resp.find("d:propstat", namespaces=ns)
+        if propstat is None:
+            continue
+        prop = propstat.find("d:prop", namespaces=ns)
+        if prop is None:
+            continue
+
+        rtype = prop.find("d:resourcetype", namespaces=ns)
+        is_dir = rtype is not None and rtype.find("d:collection", namespaces=ns) is not None
+
+        etag_el = prop.find("d:getetag", namespaces=ns)
+        etag = (etag_el.text or "").strip('"') if etag_el is not None else ""
+
+        size_el = prop.find("d:getcontentlength", namespaces=ns)
+        try:
+            size = int(size_el.text) if size_el is not None and size_el.text else 0
+        except Exception:
+            size = 0
+
+        entries.append(RemoteEntry(rel_path=rel, is_dir=is_dir, etag=etag, size=size))
+
+    return entries
+
+def webdav_recursive_list_files(session: requests.Session, base: str, root_folder: str, max_files: int = 3000) -> List[RemoteEntry]:
+    root_folder = root_folder.strip("/")
+    queue = [root_folder]
+    seen = set()
+    out: List[RemoteEntry] = []
 
     while queue:
-        cur = queue.pop(0)
-        if cur in seen_dirs:
+        folder = queue.pop(0)
+        if folder in seen:
             continue
-        seen_dirs.add(cur)
+        seen.add(folder)
 
-        entries = webdav_propfind_list(session, base, cur, depth=1)
-        # First entry is usually the folder itself; we keep children only
-        for e in entries:
-            href_rel = safe_rel_path(e.href)
-
-            # Nextcloud returns href like /remote.php/dav/files/user/path...
-            # We map to path relative to base root (after base's path)
-            # Derive base path part:
-            base_rel = safe_rel_path(base)
-            # If base includes scheme/host, base_rel will start with remote.php/...
-            # Remove base_rel prefix if present
-            if href_rel.startswith(base_rel):
-                rel = href_rel[len(base_rel):].lstrip("/")
-            else:
-                # fallback: try to find files/<user>/ segment
-                m = re.search(r"remote\.php/dav/files/[^/]+/(.*)$", href_rel)
-                rel = m.group(1) if m else href_rel
-
-            # skip the directory itself
-            if rel.rstrip("/") == cur.rstrip("/"):
+        children = webdav_list_children(session, base, folder)
+        for e in children:
+            if should_ignore_remote(e.rel_path):
                 continue
-
-            if should_ignore_remote(rel):
-                continue
-
             if e.is_dir:
-                queue.append(rel.rstrip("/"))
+                queue.append(e.rel_path.rstrip("/"))
             else:
-                p = Path(rel)
-                if p.suffix.lower() in ALLOWED_EXT:
-                    files.append(RemoteEntry(href=rel, is_dir=False, etag=e.etag, size=e.size))
-                    if len(files) >= max_files:
-                        return files
+                ext = Path(e.rel_path).suffix.lower()
+                if ext in ALLOWED_EXT:
+                    out.append(e)
+                    if len(out) >= max_files:
+                        return out
+    return out
 
-    return files
-
-def webdav_download_file(session: requests.Session, base: str, rel_path: str, dest: Path, timeout: int = 60):
-    base = base.rstrip("/")
-    rel_path = rel_path.strip("/")
-    url = f"{base}/{rel_path}" if rel_path else base + "/"
+def webdav_download(session: requests.Session, base: str, rel_path: str, dest: Path, timeout: int = 90):
+    url = _dav_url(base, rel_path)
     r = session.get(url, stream=True, timeout=timeout)
     r.raise_for_status()
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -309,72 +287,72 @@ def webdav_download_file(session: requests.Session, base: str, rel_path: str, de
             if chunk:
                 f.write(chunk)
 
-def sync_from_webdav(
-    base_url: str,
-    username: str,
-    password: str,
-    remote_folder: str,
-    progress_cb=None
-) -> Dict[str, Dict]:
-    """
-    Sync remote files -> local cache.
-    Returns manifest dict: {rel_path: {etag, size, local_path}}
-    """
-    ensure_dirs()
-    manifest_path = CACHE_DIR / "manifest.json"
-    if manifest_path.exists():
+
+# =========================
+# SYNC + INDEX
+# =========================
+def load_manifest() -> Dict[str, Dict]:
+    if MANIFEST_PATH.exists():
         try:
-            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            return json.loads(MANIFEST_PATH.read_text(encoding="utf-8"))
         except Exception:
-            manifest = {}
-    else:
-        manifest = {}
+            return {}
+    return {}
+
+def save_manifest(manifest: Dict[str, Dict]):
+    ensure_dirs()
+    MANIFEST_PATH.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def build_manifest_hash(manifest: Dict[str, Dict]) -> str:
+    items = []
+    for k in sorted(manifest.keys()):
+        v = manifest[k]
+        items.append(f"{k}|{v.get('etag','')}|{v.get('size',0)}")
+    return sha1_text("\n".join(items))
+
+def sync_from_webdav(base: str, username: str, password: str, remote_folder: str, progress_cb=None) -> Dict[str, Dict]:
+    ensure_dirs()
+    manifest = load_manifest()
 
     sess = requests.Session()
     sess.auth = (username, password)
 
-    remote_files = webdav_recursive_list_files(sess, base_url, remote_folder)
+    files = webdav_recursive_list_files(sess, base, remote_folder)
+    total = max(len(files), 1)
 
-    total = max(len(remote_files), 1)
-    updated = 0
-    for i, rf in enumerate(remote_files, start=1):
-        rel = rf.href
-        etag = rf.etag or ""
-        size = rf.size or 0
-
+    remote_set = set()
+    for i, f in enumerate(files, start=1):
+        rel = f.rel_path
+        remote_set.add(rel)
         local_path = FILES_DIR / rel
-        key = rel
 
         needs = True
-        if key in manifest:
-            old = manifest[key]
-            if old.get("etag") == etag and old.get("size") == size and Path(old.get("local_path", "")).exists():
+        if rel in manifest:
+            old = manifest[rel]
+            old_local = Path(old.get("local_path", ""))
+            if old.get("etag") == f.etag and old.get("size") == f.size and old_local.exists():
                 needs = False
 
         if needs:
             try:
-                webdav_download_file(sess, base_url, rel, local_path)
-                manifest[key] = {"etag": etag, "size": size, "local_path": str(local_path)}
-                updated += 1
-            except Exception as e:
-                # Keep going
-                manifest.setdefault(key, {"etag": etag, "size": size, "local_path": str(local_path)})
+                webdav_download(sess, base, rel, local_path)
+            except Exception:
+                # continue silently; the file will be retried next sync
+                pass
+
+        manifest[rel] = {"etag": f.etag, "size": f.size, "local_path": str(local_path)}
+
         if progress_cb:
             progress_cb(i / total, f"Sync {i}/{total} — {Path(rel).name}")
 
-    # remove entries that no longer exist
-    remote_set = {rf.href for rf in remote_files}
+    # purge deleted
     for k in list(manifest.keys()):
         if k not in remote_set:
-            # keep file but mark stale; or delete
             manifest.pop(k, None)
 
-    manifest_path.write_text(json.dumps(manifest, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_manifest(manifest)
     return manifest
 
-# =========================
-# INDEX
-# =========================
 @dataclass
 class Chunk:
     doc_path: str
@@ -384,25 +362,17 @@ class Chunk:
 @dataclass
 class KBIndex:
     vectorizer: TfidfVectorizer
-    matrix
+    matrix: Any
     chunks: List[Chunk]
     created_at: float
     manifest_hash: str
 
-def build_manifest_hash(manifest: Dict[str, Dict]) -> str:
-    # stable hash based on paths + etags + sizes
-    items = []
-    for k in sorted(manifest.keys()):
-        v = manifest[k]
-        items.append(f"{k}|{v.get('etag','')}|{v.get('size',0)}")
-    return sha1_text("\n".join(items))
-
 def index_documents(manifest: Dict[str, Dict], progress_cb=None) -> KBIndex:
     chunks: List[Chunk] = []
-    files = list(manifest.items())
-    total = max(len(files), 1)
+    items = list(manifest.items())
+    total = max(len(items), 1)
 
-    for i, (rel, meta) in enumerate(files, start=1):
+    for i, (rel, meta) in enumerate(items, start=1):
         lp = Path(meta.get("local_path", ""))
         if not lp.exists():
             continue
@@ -410,33 +380,24 @@ def index_documents(manifest: Dict[str, Dict], progress_cb=None) -> KBIndex:
             text = extract_text(lp)
             if looks_like_binary_or_empty(text):
                 continue
-            # light cleanup
             text = re.sub(r"[ \t]+", " ", text).strip()
-            cks = chunk_text(text)
-            for j, ck in enumerate(cks):
+            for j, ck in enumerate(chunk_text(text)):
                 chunks.append(Chunk(doc_path=rel, chunk_id=j, text=ck))
         except Exception:
             continue
+
         if progress_cb:
             progress_cb(i / total, f"Index {i}/{total} — {lp.name}")
 
     if not chunks:
-        # empty index
-        vectorizer = TfidfVectorizer(stop_words=None, max_features=50000, ngram_range=(1, 2))
-        matrix = vectorizer.fit_transform([""])
-        return KBIndex(vectorizer=vectorizer, matrix=matrix, chunks=[], created_at=time.time(), manifest_hash=build_manifest_hash(manifest))
+        v = TfidfVectorizer(max_features=50000, ngram_range=(1, 2))
+        m = v.fit_transform([""])
+        return KBIndex(v, m, [], time.time(), build_manifest_hash(manifest))
 
     corpus = [c.text for c in chunks]
-    vectorizer = TfidfVectorizer(stop_words=None, max_features=70000, ngram_range=(1, 2))
+    vectorizer = TfidfVectorizer(max_features=70000, ngram_range=(1, 2))
     matrix = vectorizer.fit_transform(corpus)
-
-    return KBIndex(
-        vectorizer=vectorizer,
-        matrix=matrix,
-        chunks=chunks,
-        created_at=time.time(),
-        manifest_hash=build_manifest_hash(manifest),
-    )
+    return KBIndex(vectorizer, matrix, chunks, time.time(), build_manifest_hash(manifest))
 
 def save_index(idx: KBIndex):
     ensure_dirs()
@@ -452,18 +413,18 @@ def load_index() -> Optional[KBIndex]:
             return None
     return None
 
+
 # =========================
 # RETRIEVAL + ANSWER
 # =========================
 def retrieve(idx: KBIndex, query: str, top_k: int = TOP_K) -> List[Tuple[Chunk, float]]:
-    if not idx.chunks:
+    if not idx or not idx.chunks:
         return []
     q = norm(query)
     if not q:
         return []
     qv = idx.vectorizer.transform([q])
     sims = cosine_similarity(qv, idx.matrix).ravel()
-    # top indices
     top_idx = sims.argsort()[::-1][:top_k]
     out = []
     for i in top_idx:
@@ -473,125 +434,99 @@ def retrieve(idx: KBIndex, query: str, top_k: int = TOP_K) -> List[Tuple[Chunk, 
     return out
 
 def build_answer(query: str, hits: List[Tuple[Chunk, float]]) -> str:
-    # Simple “extractive + structured” answer (no LLM), but useful + safe.
-    # If you later want LLM, you can swap this block.
     if not hits:
-        return "Je n’ai pas trouvé d’élément suffisamment sourcé dans la base. Essaie une formulation plus précise, ou ajoute le document manquant dans la KB."
+        return "Je n’ai pas trouvé de source suffisamment pertinente dans la base. Reformule, ou ajoute le document manquant dans la KB."
 
-    # Merge snippets
-    bullets = []
+    lines = ["Voici ce que la base contient de plus pertinent (extraits) :"]
     sources = []
     for ch, sc in hits:
-        snippet = ch.text
-        snippet = re.sub(r"\s+", " ", snippet).strip()
-        snippet = snippet[:420] + ("…" if len(snippet) > 420 else "")
-        bullets.append(f"- {snippet}")
+        snippet = re.sub(r"\s+", " ", ch.text).strip()
+        snippet = snippet[:480] + ("…" if len(snippet) > 480 else "")
+        lines.append(f"- {snippet}")
         sources.append(f"{ch.doc_path}#chunk{ch.chunk_id}")
+    lines.append("")
+    lines.append("Sources :")
+    lines.extend([f"- {s}" for s in sources])
+    return "\n".join(lines)
 
-    # Provide a “best effort” summary without inventing:
-    # We present “points pertinents” as extracted bullets.
-    answer = []
-    answer.append("Voici ce que la base contient de plus pertinent (extraits) :")
-    answer.extend(bullets)
-    answer.append("")
-    answer.append("Sources :")
-    for s in sources:
-        answer.append(f"- {s}")
-    return "\n".join(answer)
 
 # =========================
 # STREAMLIT UI
 # =========================
 st.set_page_config(page_title=APP_TITLE, layout="wide")
 st.title(APP_TITLE)
-st.caption("Connexion WebDAV → sync → index → réponses sourcées (fichier + extrait).")
-
-with st.expander("⚙️ Connexion Cloudbox (WebDAV)", expanded=True):
-    col1, col2, col3 = st.columns([2, 1, 1])
-    with col1:
-        webdav_base = st.text_input("URL WebDAV (base)", value=DEFAULT_WEBDAV_BASE)
-        remote_folder = st.text_input("Dossier à indexer (dans ton WebDAV)", value="KB_CentreSeminaire_OFFICIEL")
-        st.caption("Astuce: crée un dossier KB_CentreSeminaire_OFFICIEL dans Cloudbox et mets-y tes docs 'OFFICIEL'.")
-    with col2:
-        username = st.text_input("Identifiant", value="ambroise.leleve")
-    with col3:
-        password = st.text_input("Mot de passe (idéal: mot de passe d’application)", type="password")
-
-    colA, colB, colC = st.columns([1, 1, 2])
-    do_sync = colA.button("📥 Mettre à jour depuis Cloudbox", use_container_width=True)
-    do_reindex = colB.button("🧠 Réindexer", use_container_width=True)
-    show_cache = colC.checkbox("Afficher infos cache/index", value=False)
+st.caption("WebDAV Nextcloud → Sync → Index → Chat sourcé.")
 
 ensure_dirs()
-
-# Load manifest + index
-manifest_path = CACHE_DIR / "manifest.json"
-manifest = {}
-if manifest_path.exists():
-    try:
-        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    except Exception:
-        manifest = {}
-
+manifest = load_manifest()
 idx = load_index()
 
-def progress_ui(p, label):
-    st.session_state["_p"] = p
-    st.session_state["_label"] = label
+with st.expander("⚙️ Connexion Cloudbox (WebDAV)", expanded=True):
+    c1, c2, c3 = st.columns([2, 1, 1])
+    with c1:
+        webdav_base = st.text_input("URL WebDAV (base)", value=DEFAULT_WEBDAV_BASE)
+        remote_folder = st.text_input("Dossier à indexer", value="KB_CentreSeminaire_OFFICIEL")
+        st.caption("Crée ce dossier dans Cloudbox (OFFICIEL). Mets les archives dans 99_ARCHIVES ou ARCHIVES.")
+    with c2:
+        username = st.text_input("Identifiant", value="ambroise.leleve")
+    with c3:
+        password = st.text_input("Mot de passe (idéal: mot de passe d’application)", type="password")
 
-if do_sync:
+    b1, b2, b3 = st.columns([1, 1, 2])
+    btn_sync_reindex = b1.button("📥 Sync + 🧠 Réindex", use_container_width=True)
+    btn_reindex = b2.button("🧠 Réindex (sans sync)", use_container_width=True)
+    debug = b3.checkbox("Debug", value=False)
+
+if debug:
+    st.write("Cache:", str(CACHE_DIR))
+    st.write("Manifest:", len(manifest))
+    if idx:
+        st.write("Chunks:", len(idx.chunks))
+        st.write("Index date:", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(idx.created_at)))
+        st.write("Manifest hash:", idx.manifest_hash)
+
+def prog_cb_factory():
+    prog = st.progress(0, text="…")
+    def cb(frac, label):
+        prog.progress(min(max(frac, 0.0), 1.0), text=label)
+    return cb
+
+if btn_sync_reindex:
     if not webdav_base or not username or not password or not remote_folder:
-        st.error("Renseigne URL WebDAV, identifiant, mot de passe et dossier.")
+        st.error("Renseigne URL, identifiant, mot de passe et dossier.")
     else:
-        prog = st.progress(0, text="Sync…")
-        def cb(frac, label):
-            prog.progress(min(max(frac, 0.0), 1.0), text=label)
         try:
+            cb = prog_cb_factory()
             manifest = sync_from_webdav(webdav_base, username, password, remote_folder, progress_cb=cb)
-            st.success(f"Sync terminée. Fichiers suivis: {len(manifest)}")
+            st.success(f"Sync OK — {len(manifest)} fichiers suivis.")
         except Exception as e:
             st.error(f"Erreur sync WebDAV: {e}")
 
-        # auto reindex after sync to keep it simple
-        prog = st.progress(0, text="Index…")
-        def cb2(frac, label):
-            prog.progress(min(max(frac, 0.0), 1.0), text=label)
         try:
+            cb2 = prog_cb_factory()
             idx = index_documents(manifest, progress_cb=cb2)
             save_index(idx)
             st.success("Index mis à jour.")
         except Exception as e:
             st.error(f"Erreur indexation: {e}")
 
-if do_reindex:
+if btn_reindex:
     if not manifest:
-        st.warning("Pas de manifest. Fais d’abord 'Mettre à jour depuis Cloudbox'.")
+        st.warning("Pas de manifest. Fais d’abord Sync.")
     else:
-        prog = st.progress(0, text="Index…")
-        def cb2(frac, label):
-            prog.progress(min(max(frac, 0.0), 1.0), text=label)
         try:
+            cb2 = prog_cb_factory()
             idx = index_documents(manifest, progress_cb=cb2)
             save_index(idx)
             st.success("Index mis à jour.")
         except Exception as e:
             st.error(f"Erreur indexation: {e}")
-
-if show_cache:
-    st.write("Cache:", str(CACHE_DIR))
-    st.write("Fichiers:", str(FILES_DIR))
-    st.write("Manifest entries:", len(manifest))
-    if idx:
-        st.write("Index chunks:", len(idx.chunks))
-        st.write("Index created:", time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(idx.created_at)))
-        st.write("Index manifest_hash:", idx.manifest_hash)
 
 st.divider()
+st.subheader("💬 Chat (réponses sourcées)")
 
-# Chat UI
-st.subheader("💬 Chat")
 if not idx or not idx.chunks:
-    st.info("Aucun index disponible. Clique sur 'Mettre à jour depuis Cloudbox' puis réessaie.")
+    st.info("Aucun index. Clique sur “Sync + Réindex”.")
     st.stop()
 
 if "chat" not in st.session_state:
@@ -601,7 +536,7 @@ for role, content in st.session_state.chat:
     with st.chat_message(role):
         st.markdown(content)
 
-q = st.chat_input("Pose une question (ex: 'livraison traiteur la veille', 'capacités salle du conseil', 'annulation devis')")
+q = st.chat_input("Pose une question (ex: 'livraison traiteur', 'capacité salle du Conseil', 'règles technique')")
 
 if q:
     st.session_state.chat.append(("user", q))
@@ -611,7 +546,7 @@ if q:
     hits = retrieve(idx, q, top_k=TOP_K)
 
     if REQUIRE_SOURCES and not hits:
-        a = "Je ne peux pas répondre de façon fiable: je n’ai pas trouvé de source pertinente dans la base. Ajoute/actualise le document (ou reformule)."
+        a = "Je ne peux pas répondre de façon fiable: aucune source pertinente trouvée. Ajoute/actualise le doc dans la KB ou reformule."
     else:
         a = build_answer(q, hits)
 
@@ -619,4 +554,4 @@ if q:
     with st.chat_message("assistant"):
         st.markdown(a)
 
-st.caption("Note: ce bot répond à partir des documents indexés. Pour améliorer les réponses: ajoute des docs 'OFFICIEL' bien titrés et clique 'Mettre à jour'.")
+st.caption("Conseil: commence avec 10–20 docs OFFICIELS. Plus tu ajoutes des archives, plus tu obtiens des réponses 'vieilles'.")
